@@ -51,7 +51,21 @@ class PSOConfig:
 
 
 class ParticleSwarmOptimizer:
-    """粒子群算法机位优化器。"""
+    """粒子群算法机位优化器。
+
+    运行生命周期
+    ------------
+    每次调用 :meth:`optimize`（``continue_run=False``，默认）都从完全独立的
+    状态开始：随机数发生器按 ``config.seed`` 重新播种，收敛历史、全局最优、
+    个体最优等运行状态全部清空，同一实例上的重复运行互不泄漏。固定种子下
+    重复调用 ``optimize()`` 得到逐位一致的结果（重放）。
+
+    需要连续试验（在已有粒子群基础上继续迭代）时，显式传入
+    ``continue_run=True``：本次运行从上次运行保留的粒子位置、速度、个体
+    最优、全局最优与随机数状态接续执行，历史记录追加而非重置。接续运行的
+    结果中 ``best_generation`` 与 ``n_generations`` 为累计迭代数，可与
+    重放区分。
+    """
 
     def __init__(
         self,
@@ -66,8 +80,6 @@ class ParticleSwarmOptimizer:
         self.boundary = boundary
         self.fitness_fn = fitness_fn
         self.config = config if config is not None else PSOConfig()
-
-        self.rng = np.random.default_rng(self.config.seed)
 
         self.min_spacing = compute_min_spacing_from_diameters(
             self.rotor_diameters,
@@ -91,12 +103,27 @@ class ParticleSwarmOptimizer:
             else:
                 self.pos_bounds[i] = [boundary.y_min, boundary.y_max]
 
-        self._best_global_pos = None
+        # 单次运行状态（每次普通 optimize() 调用前由 _reset_run_state 重置）
+        self.rng = np.random.default_rng(self.config.seed)
+        self._reset_run_state()
+
+    def _reset_run_state(self) -> None:
+        """重置单次运行的全部状态，使新一次运行从独立状态开始。"""
+        self.rng = np.random.default_rng(self.config.seed)
+
+        self._best_global_pos: Optional[np.ndarray] = None
         self._best_global_fitness = -np.inf
         self._best_iteration = 0
 
         self.convergence_history: list[float] = []
         self.mean_history: list[float] = []
+
+        # 上一次运行保留的粒子群状态（供 continue_run=True 接续使用）
+        self._last_positions: Optional[np.ndarray] = None
+        self._last_velocities: Optional[np.ndarray] = None
+        self._last_personal_best_pos: Optional[np.ndarray] = None
+        self._last_personal_best_fitness: Optional[np.ndarray] = None
+        self._iterations_completed = 0
 
     def _initialize_swarm(self, swarm_size: int) -> tuple[np.ndarray, np.ndarray]:
         """初始化粒子群。"""
@@ -199,15 +226,43 @@ class ParticleSwarmOptimizer:
 
         return positions.flatten()
 
-    def optimize(self, verbose: bool = True) -> "OptimizeResult":
+    def optimize(self, verbose: bool = True, continue_run: bool = False) -> "OptimizeResult":
         """执行优化。
+
+        Parameters
+        ----------
+        verbose : bool
+            是否打印进度信息
+        continue_run : bool
+            False（默认）：开始一次全新的独立运行，重置历史、全局最优、
+            个体最优与随机数状态（按 config.seed 重新播种）。
+            True：从上一次运行保留的粒子位置、速度、个体最优、全局最优与
+            随机数状态接续迭代，历史记录追加；要求此前已完成至少一次运行。
 
         Returns
         -------
         OptimizeResult
-            优化结果
+            优化结果。保证 ``n_generations == len(convergence_history)
+            == len(mean_history)``，``best_fitness == convergence_history[-1]``
+            且等于最终粒子群的最大适应度，``best_positions`` 为独立副本，
+            不会被后续运行或粒子位置数组的写入改动。
         """
         from .ga import OptimizeResult
+
+        if continue_run:
+            if self._last_positions is None:
+                raise RuntimeError(
+                    "没有可接续的运行状态：请先完成一次普通运行 "
+                    "(continue_run=False)，再使用 continue_run=True 接续。"
+                )
+            if self._last_positions.shape[0] != self.config.swarm_size:
+                raise ValueError(
+                    f"接续运行的粒子群大小 ({self.config.swarm_size}) "
+                    f"与上次运行保留的粒子群大小 ({self._last_positions.shape[0]}) "
+                    f"不一致；如需修改 swarm_size 请使用普通运行 (continue_run=False)。"
+                )
+        else:
+            self._reset_run_state()
 
         swarm_size = self.config.swarm_size
         max_iter = self.config.max_iterations
@@ -220,27 +275,39 @@ class ParticleSwarmOptimizer:
             print(f"\n=== 粒子群优化开始 ===")
             print(f"风机台数: {self.n_turbines}")
             print(f"粒子群大小: {swarm_size}")
-            print(f"最大迭代: {max_iter}")
+            print(f"本次迭代: {max_iter}"
+                  + (f"（接续运行，已完成 {self._iterations_completed} 次迭代）"
+                     if continue_run else ""))
             print(f"最小间距: {self.min_spacing:.1f} m "
                   f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
             print(f"w={w}, c1={c1}, c2={c2}")
             print("=" * 35)
 
-        positions, velocities = self._initialize_swarm(swarm_size)
-        fitness = self._evaluate_particles(positions)
+        if continue_run:
+            positions = self._last_positions.copy()
+            velocities = self._last_velocities.copy()
+            best_personal_pos = self._last_personal_best_pos.copy()
+            best_personal_fitness = self._last_personal_best_fitness.copy()
+            fitness = self._evaluate_particles(positions)
+        else:
+            positions, velocities = self._initialize_swarm(swarm_size)
+            fitness = self._evaluate_particles(positions)
 
-        best_personal_pos = positions.copy()
-        best_personal_fitness = fitness.copy()
+            best_personal_pos = positions.copy()
+            best_personal_fitness = fitness.copy()
 
-        best_global_idx = np.argmax(fitness)
-        self._best_global_pos = positions[best_global_idx].reshape(self.n_turbines, 2).copy()
-        self._best_global_fitness = float(fitness[best_global_idx])
-        self._best_iteration = 0
+            best_global_idx = np.argmax(fitness)
+            self._best_global_pos = positions[best_global_idx].reshape(
+                self.n_turbines, 2
+            ).copy()
+            self._best_global_fitness = float(fitness[best_global_idx])
+            self._best_iteration = 0
 
-        for iteration in range(max_iter):
+            # 第 0 次迭代（初始粒子群）的历史记录
             self.convergence_history.append(float(self._best_global_fitness))
             self.mean_history.append(float(np.mean(fitness)))
 
+        for iteration in range(max_iter):
             r1 = self.rng.random((swarm_size, self.n_dim))
             r2 = self.rng.random((swarm_size, self.n_dim))
 
@@ -277,15 +344,37 @@ class ParticleSwarmOptimizer:
                 self._best_global_pos = positions[current_best_idx].reshape(
                     self.n_turbines, 2
                 ).copy()
-                self._best_iteration = iteration + 1
+                self._best_iteration = self._iterations_completed + iteration + 1
+
+            self.convergence_history.append(float(self._best_global_fitness))
+            self.mean_history.append(float(np.mean(fitness)))
 
             if verbose and (iteration % 5 == 0 or iteration == max_iter - 1):
                 print(
-                    f"Iter {iteration+1:3d} | "
+                    f"Iter {self._iterations_completed + iteration + 1:3d} | "
                     f"Best: {self._best_global_fitness/1e3:8.2f} GWh | "
                     f"Mean: {np.mean(fitness)/1e3:8.2f} GWh | "
                     f"Found@Iter {self._best_iteration}"
                 )
+
+        self._iterations_completed += max_iter
+
+        # 为可能的接续运行保留粒子群状态（拷贝，保持接续动态与单次长运行
+        # 完全一致，故不能在内部状态上做任何替换）
+        self._last_positions = positions.copy()
+        self._last_velocities = velocities.copy()
+        self._last_personal_best_pos = best_personal_pos.copy()
+        self._last_personal_best_fitness = best_personal_fitness.copy()
+
+        # 返回用副本：粒子可能已飞离历史最优点，用全局最优位置替换最差
+        # 粒子，使 final_population / final_fitness 与 best_positions /
+        # best_fitness 严格一致（仅影响返回值，不影响接续运行的动态）
+        result_positions = positions.copy()
+        result_fitness = fitness.copy()
+        if self._best_global_fitness > float(np.max(result_fitness)):
+            worst_idx = int(np.argmin(result_fitness))
+            result_positions[worst_idx] = self._best_global_pos.flatten()
+            result_fitness[worst_idx] = self._best_global_fitness
 
         if verbose:
             print("=" * 35)
@@ -293,12 +382,43 @@ class ParticleSwarmOptimizer:
             print(f"最优净AEP: {self._best_global_fitness/1e3:.2f} GWh")
             print(f"找到最优解的迭代: {self._best_iteration}")
 
-        return OptimizeResult(
+        result = OptimizeResult(
             best_positions=self._best_global_pos.copy(),
             best_fitness=float(self._best_global_fitness),
             best_generation=self._best_iteration,
             convergence_history=self.convergence_history.copy(),
             mean_history=self.mean_history.copy(),
-            final_population=positions.copy(),
-            final_fitness=fitness.copy(),
+            final_population=result_positions,
+            final_fitness=result_fitness,
+            n_generations=self._iterations_completed,
+        )
+        self._check_result_consistency(result)
+        return result
+
+    @staticmethod
+    def _check_result_consistency(result: "OptimizeResult") -> None:
+        """校验结果内部一致性（迭代数、历史长度、最终粒子群与最优适应度）。"""
+        assert len(result.convergence_history) == result.n_generations + 1, (
+            f"收敛历史长度 ({len(result.convergence_history)}) "
+            f"与迭代数 ({result.n_generations}) 不一致"
+        )
+        assert len(result.mean_history) == result.n_generations + 1, (
+            f"平均适应度历史长度 ({len(result.mean_history)}) "
+            f"与迭代数 ({result.n_generations}) 不一致"
+        )
+        assert result.convergence_history[-1] == result.best_fitness, (
+            f"收敛历史末位 ({result.convergence_history[-1]}) "
+            f"与最优适应度 ({result.best_fitness}) 不一致"
+        )
+        assert 0 <= result.best_generation <= result.n_generations, (
+            f"最优解迭代 ({result.best_generation}) 超出 [0, {result.n_generations}]"
+        )
+        assert result.final_population.shape[0] == result.final_fitness.shape[0], (
+            "最终粒子群与最终适应度数量不一致"
+        )
+        assert np.isclose(
+            result.best_fitness, np.max(result.final_fitness), rtol=1e-9, atol=1e-9
+        ), (
+            f"最优适应度 ({result.best_fitness}) 与最终粒子群最大适应度 "
+            f"({np.max(result.final_fitness)}) 不一致"
         )

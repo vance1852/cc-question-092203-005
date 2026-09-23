@@ -73,6 +73,9 @@ class OptimizeResult:
         最终种群 (pop_size, N_turb*2)
     final_fitness : np.ndarray
         最终种群适应度 (pop_size,)
+    n_generations : int
+        本次运行实际执行的代数（含接续运行的累计代数），
+        与 convergence_history / mean_history 的长度一致
     """
 
     best_positions: np.ndarray
@@ -82,6 +85,7 @@ class OptimizeResult:
     mean_history: list[float]
     final_population: np.ndarray
     final_fitness: np.ndarray
+    n_generations: int = 0
 
 
 class GeneticAlgorithm:
@@ -89,6 +93,18 @@ class GeneticAlgorithm:
 
     优化目标：最大化年净发电量（等价于最小化尾流损失）。
     约束：最小间距、场地边界内。
+
+    运行生命周期
+    ------------
+    每次调用 :meth:`optimize`（``continue_run=False``，默认）都从完全独立的
+    状态开始：随机数发生器按 ``config.seed`` 重新播种，收敛历史、全局最优等
+    运行状态全部清空，同一实例上的重复运行互不泄漏。固定种子下重复调用
+    ``optimize()`` 得到逐位一致的结果（重放）。
+
+    需要连续试验（在已有种群基础上继续进化）时，显式传入
+    ``continue_run=True``：本次运行从上次运行保留的种群、最优解与随机数
+    状态接续执行，历史记录追加而非重置。接续运行的结果中
+    ``best_generation`` 与 ``n_generations`` 为累计代数，可与重放区分。
     """
 
     def __init__(
@@ -119,8 +135,6 @@ class GeneticAlgorithm:
         self.fitness_fn = fitness_fn
         self.config = config if config is not None else GAConfig()
 
-        self.rng = np.random.default_rng(self.config.seed)
-
         self.min_spacing = compute_min_spacing_from_diameters(
             self.rotor_diameters,
             self.config.min_spacing_multiple,
@@ -130,12 +144,25 @@ class GeneticAlgorithm:
         self.x_range = boundary.x_max - boundary.x_min
         self.y_range = boundary.y_max - boundary.y_min
 
-        self._best_positions = None
+        # 单次运行状态（每次普通 optimize() 调用前由 _reset_run_state 重置）
+        self.rng = np.random.default_rng(self.config.seed)
+        self._reset_run_state()
+
+    def _reset_run_state(self) -> None:
+        """重置单次运行的全部状态，使新一次运行从独立状态开始。"""
+        self.rng = np.random.default_rng(self.config.seed)
+
+        self._best_positions: Optional[np.ndarray] = None
         self._best_fitness = -np.inf
         self._best_generation = 0
 
         self.convergence_history: list[float] = []
         self.mean_history: list[float] = []
+
+        # 上一次运行保留的种群（供 continue_run=True 接续使用）
+        self._last_population: Optional[np.ndarray] = None
+        self._last_fitness: Optional[np.ndarray] = None
+        self._generations_completed = 0
 
     def _initialize_population(self, pop_size: int) -> np.ndarray:
         """初始化种群。
@@ -275,19 +302,42 @@ class GeneticAlgorithm:
 
         return positions.flatten()
 
-    def optimize(self, verbose: bool = True) -> OptimizeResult:
+    def optimize(self, verbose: bool = True, continue_run: bool = False) -> OptimizeResult:
         """执行优化。
 
         Parameters
         ----------
         verbose : bool
             是否打印进度信息
+        continue_run : bool
+            False（默认）：开始一次全新的独立运行，重置历史、最优解与
+            随机数状态（按 config.seed 重新播种）。
+            True：从上一次运行保留的种群、最优解与随机数状态接续进化，
+            历史记录追加；要求此前已完成至少一次运行。
 
         Returns
         -------
         OptimizeResult
-            优化结果
+            优化结果。保证 ``n_generations == len(convergence_history)
+            == len(mean_history)``，``best_fitness == convergence_history[-1]``
+            且等于最终种群的最大适应度，``best_positions`` 为独立副本，
+            不会被后续运行或种群数组的写入改动。
         """
+        if continue_run:
+            if self._last_population is None:
+                raise RuntimeError(
+                    "没有可接续的运行状态：请先完成一次普通运行 "
+                    "(continue_run=False)，再使用 continue_run=True 接续。"
+                )
+            if self._last_population.shape[0] != self.config.population_size:
+                raise ValueError(
+                    f"接续运行的种群大小 ({self.config.population_size}) "
+                    f"与上次运行保留的种群大小 ({self._last_population.shape[0]}) "
+                    f"不一致；如需修改 population_size 请使用普通运行 (continue_run=False)。"
+                )
+        else:
+            self._reset_run_state()
+
         pop_size = self.config.population_size
         max_gen = self.config.max_generations
 
@@ -297,24 +347,36 @@ class GeneticAlgorithm:
             print(f"\n=== 遗传算法优化开始 ===")
             print(f"风机台数: {self.n_turbines}")
             print(f"种群大小: {pop_size}")
-            print(f"最大代数: {max_gen}")
+            print(f"本次代数: {max_gen}"
+                  + (f"（接续运行，已完成 {self._generations_completed} 代）"
+                     if continue_run else ""))
             print(f"最小间距: {self.min_spacing:.1f} m "
                   f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
             print(f"场地面积: {self.boundary.area / 1e6:.2f} km²")
             print("=" * 35)
 
-        population = self._initialize_population(pop_size)
-        fitness = self._evaluate_population(population)
+        if continue_run:
+            population = self._last_population.copy()
+            fitness = self._last_fitness.copy()
+        else:
+            population = self._initialize_population(pop_size)
+            fitness = self._evaluate_population(population)
 
-        best_idx = np.argmax(fitness)
-        self._best_fitness = fitness[best_idx]
-        self._best_positions = population[best_idx].reshape(self.n_turbines, 2)
-        self._best_generation = 0
+            best_idx = np.argmax(fitness)
+            self._best_fitness = float(fitness[best_idx])
+            # 必须拷贝：population[best_idx] 是种群数组的视图，
+            # 不拷贝会被后续对种群行的写入悄悄改动最优位置
+            self._best_positions = population[best_idx].reshape(
+                self.n_turbines, 2
+            ).copy()
+            self._best_generation = 0
 
-        for gen in range(max_gen):
+            # 第 0 代（初始种群）的历史记录；之后每完成一代追加一条，
+            # 保证 len(history) == n_generations + 1 且末位等于 best_fitness
             self.convergence_history.append(float(self._best_fitness))
             self.mean_history.append(float(np.mean(fitness)))
 
+        for gen in range(max_gen):
             elite_idx = np.argsort(fitness)[-n_elite:]
             elites = population[elite_idx].copy()
 
@@ -344,15 +406,24 @@ class GeneticAlgorithm:
                 self._best_positions = population[current_best_idx].reshape(
                     self.n_turbines, 2
                 ).copy()
-                self._best_generation = gen + 1
+                self._best_generation = self._generations_completed + gen + 1
+
+            self.convergence_history.append(float(self._best_fitness))
+            self.mean_history.append(float(np.mean(fitness)))
 
             if verbose and (gen % 5 == 0 or gen == max_gen - 1):
                 print(
-                    f"Gen {gen+1:3d} | "
+                    f"Gen {self._generations_completed + gen + 1:3d} | "
                     f"Best: {self._best_fitness/1e3:8.2f} GWh | "
                     f"Mean: {np.mean(fitness)/1e3:8.2f} GWh | "
                     f"Found@Gen {self._best_generation}"
                 )
+
+        self._generations_completed += max_gen
+
+        # 为可能的接续运行保留最终种群（拷贝，避免结果被后续运行改动）
+        self._last_population = population.copy()
+        self._last_fitness = fitness.copy()
 
         if verbose:
             print("=" * 35)
@@ -360,7 +431,7 @@ class GeneticAlgorithm:
             print(f"最优净AEP: {self._best_fitness/1e3:.2f} GWh")
             print(f"找到最优解的代数: {self._best_generation}")
 
-        return OptimizeResult(
+        result = OptimizeResult(
             best_positions=self._best_positions.copy(),
             best_fitness=float(self._best_fitness),
             best_generation=self._best_generation,
@@ -368,4 +439,35 @@ class GeneticAlgorithm:
             mean_history=self.mean_history.copy(),
             final_population=population.copy(),
             final_fitness=fitness.copy(),
+            n_generations=self._generations_completed,
+        )
+        self._check_result_consistency(result)
+        return result
+
+    @staticmethod
+    def _check_result_consistency(result: OptimizeResult) -> None:
+        """校验结果内部一致性（代数、历史长度、最终种群与最优适应度）。"""
+        assert len(result.convergence_history) == result.n_generations + 1, (
+            f"收敛历史长度 ({len(result.convergence_history)}) "
+            f"与代数 ({result.n_generations}) 不一致"
+        )
+        assert len(result.mean_history) == result.n_generations + 1, (
+            f"平均适应度历史长度 ({len(result.mean_history)}) "
+            f"与代数 ({result.n_generations}) 不一致"
+        )
+        assert result.convergence_history[-1] == result.best_fitness, (
+            f"收敛历史末位 ({result.convergence_history[-1]}) "
+            f"与最优适应度 ({result.best_fitness}) 不一致"
+        )
+        assert 0 <= result.best_generation <= result.n_generations, (
+            f"最优解代数 ({result.best_generation}) 超出 [0, {result.n_generations}]"
+        )
+        assert result.final_population.shape[0] == result.final_fitness.shape[0], (
+            "最终种群与最终适应度数量不一致"
+        )
+        assert np.isclose(
+            result.best_fitness, np.max(result.final_fitness), rtol=1e-9, atol=1e-9
+        ), (
+            f"最优适应度 ({result.best_fitness}) 与最终种群最大适应度 "
+            f"({np.max(result.final_fitness)}) 不一致"
         )
